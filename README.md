@@ -43,6 +43,17 @@ sam deploy --guided   # first time: pick a stack name and region, accept the def
 
 Note the `WebhookUrl` and `SecretArn` outputs. Later deploys are just `sam build && sam deploy`.
 
+To get emailed when reviews fail (land in the dead-letter queue), set the optional `AlarmEmail` parameter:
+
+```bash
+sam deploy --parameter-overrides AlarmEmail=you@example.com
+```
+
+AWS then sends a "Subscription Confirmation" email; click its link or nothing is delivered. The alarm emails
+on ALARM and again when it returns to OK (after the DLQ is drained). Leave `AlarmEmail` empty for no email;
+the `AlarmTopicArn` output is the SNS topic if you'd rather subscribe something else. Later plain
+`sam deploy` runs keep the previous value; pass `AlarmEmail=""` to remove the subscription.
+
 `sam deploy --guided` will warn that WebhookFunction has no authorization. That's expected:
 GitHub's webhook signature is the authentication, and the function rejects anything unsigned.
 
@@ -105,6 +116,7 @@ sam logs -n ReviewWorkerFunction --stack-name <stack> --tail
 | What | Where |
 |---|---|
 | Model | `AnthropicModel` stack parameter |
+| Failure alert email | `AlarmEmail` stack parameter (confirm the SNS email) |
 | Review instructions | `SYSTEM_PROMPT` in `src/lib/reviewer.ts` |
 | Ignored files | `IGNORED_PATH_PATTERNS` in `src/lib/diff.ts` |
 | Max diff size | `MAX_DIFF_CHARS` in `src/lib/diff.ts` |
