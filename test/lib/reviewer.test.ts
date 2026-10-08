@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseModelResponse, parseReviewResult } from "../../src/lib/reviewer.js";
+import { classifyStopReason, parseModelResponse, parseReviewResult } from "../../src/lib/reviewer.js";
 
 const validComment = { path: "a.ts", line: 3, severity: "critical", body: "Bug here" };
 
@@ -58,7 +58,10 @@ describe("parseReviewResult", () => {
 describe("parseModelResponse", () => {
   it("parses a JSON review from a text block", () => {
     const body = JSON.stringify({ summary: "ok", comments: [validComment] });
-    expect(parseModelResponse(textResponse(body))).toEqual({ summary: "ok", comments: [validComment] });
+    expect(parseModelResponse(textResponse(body))).toEqual({
+      kind: "reviewed",
+      review: { summary: "ok", comments: [validComment] },
+    });
   });
 
   it("ignores non-text blocks (such as thinking) and joins text blocks", () => {
@@ -71,19 +74,37 @@ describe("parseModelResponse", () => {
         { type: "text", text: body.slice(10) },
       ],
     };
-    expect(parseModelResponse(response).summary).toBe("ok");
+    expect(parseModelResponse(response)).toMatchObject({ kind: "reviewed", review: { summary: "ok" } });
   });
 
-  it.each(["max_tokens", "refusal", "tool_use", "pause_turn", null])(
-    "throws when stop_reason is %j",
-    (stopReason) => {
-      const body = JSON.stringify({ summary: "ok", comments: [] });
-      expect(() => parseModelResponse(textResponse(body, stopReason))).toThrow("did not finish the review");
-    },
-  );
+  it.each(["tool_use", "pause_turn", "stop_sequence", null])("throws when stop_reason is %j", (stopReason) => {
+    const body = JSON.stringify({ summary: "ok", comments: [] });
+    expect(() => parseModelResponse(textResponse(body, stopReason))).toThrow("did not finish the review");
+  });
 
-  it("checks stop_reason before parsing, so truncated JSON reports the stop reason", () => {
-    expect(() => parseModelResponse(textResponse('{"summary": "cut', "max_tokens"))).toThrow(/max_tokens/);
+  it.each([
+    ["refusal", "refusal"],
+    ["max_tokens", "max_tokens"],
+    ["model_context_window_exceeded", "context_window_exceeded"],
+  ])("returns unreviewable for stop_reason %j", (stopReason, reason) => {
+    expect(parseModelResponse(textResponse("", stopReason))).toEqual({
+      kind: "unreviewable",
+      reason,
+      stopReason,
+      refusalCategory: null,
+    });
+  });
+
+  it("checks stop_reason before parsing, so truncated JSON is unreviewable rather than a parse error", () => {
+    expect(parseModelResponse(textResponse('{"summary": "cut', "max_tokens"))).toMatchObject({
+      kind: "unreviewable",
+      reason: "max_tokens",
+    });
+  });
+
+  it("carries the refusal category through", () => {
+    const response = { ...textResponse("", "refusal"), stop_details: { category: "cyber" } };
+    expect(parseModelResponse(response)).toMatchObject({ kind: "unreviewable", refusalCategory: "cyber" });
   });
 
   it("throws on malformed JSON", () => {
@@ -100,5 +121,11 @@ describe("parseModelResponse", () => {
 
   it("throws when the JSON is null", () => {
     expect(() => parseModelResponse(textResponse("null"))).toThrow("missing a summary");
+  });
+});
+
+describe("classifyStopReason", () => {
+  it.each(["end_turn", "tool_use", "pause_turn", "stop_sequence", null])("returns undefined for %j", (stopReason) => {
+    expect(classifyStopReason(stopReason)).toBeUndefined();
   });
 });

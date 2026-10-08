@@ -6,6 +6,7 @@ import {
   listChangedFiles,
   partitionComments,
   postReview,
+  postUnreviewableNotice,
 } from "./lib/github.js";
 import { logger } from "./lib/logger.js";
 import { requestReview } from "./lib/reviewer.js";
@@ -39,12 +40,29 @@ async function reviewPullRequest(job: ReviewJob): Promise<void> {
   }
 
   const startedAt = Date.now();
-  const review = await requestReview({
+  const outcome = await requestReview({
     title: pullRequest.title,
     description: pullRequest.body ?? "",
     files: included,
     skippedFiles: skipped,
   });
+
+  // Permanent failure: tell the PR once and return normally so SQS doesn't retry a doomed job.
+  if (outcome.kind === "unreviewable") {
+    await postUnreviewableNotice(octokit, job, outcome.reason);
+    logger.warn("Review not possible, posted notice", {
+      ...context,
+      headSha: job.headSha,
+      reason: outcome.reason,
+      stopReason: outcome.stopReason,
+      refusalCategory: outcome.refusalCategory,
+      filesReviewed: included.length,
+      modelMs: Date.now() - startedAt,
+    });
+    return;
+  }
+
+  const { review } = outcome;
   const { inline, general } = partitionComments(review.comments, included);
 
   await postReview(octokit, job, { summary: review.summary, inline, general, skippedFiles: skipped });
