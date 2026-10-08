@@ -1,0 +1,147 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Basic AI code review bot (GitHub App -> Lambda -> SQS -> Lambda -> Claude)
+
+Parameters:
+  AnthropicModel:
+    Type: String
+    Default: claude-sonnet-5-5
+    Description: Claude model used for reviews
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Architectures: [arm64]
+    Tracing: Active
+    LoggingConfig:
+      LogFormat: JSON
+    Environment:
+      Variables:
+        SECRET_ARN: !Ref BotSecret
+        NODE_OPTIONS: --enable-source-maps
+
+Resources:
+  # One secret holding all credentials. Fill it in after the first deploy (see README).
+  BotSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: GitHub App credentials, webhook secret and Anthropic API key for the review bot
+      SecretString: '{"githubAppId":"","githubPrivateKey":"","githubWebhookSecret":"","anthropicApiKey":""}'
+
+  ReviewDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600 # 14 days to inspect failures
+
+  ReviewQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 1800 # 6x the worker timeout, as AWS recommends
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ReviewDeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  # Public HTTPS endpoint GitHub posts to. Authenticated by the webhook signature, not IAM.
+  WebhookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./
+      Handler: webhook.handler
+      Timeout: 10
+      MemorySize: 256
+      FunctionUrlConfig:
+        AuthType: NONE
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref ReviewQueue
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ReviewQueue.QueueName
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref BotSecret
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints: [src/webhook.ts]
+        Format: esm
+        OutExtension: [.js=.mjs]
+        Target: es2022
+        Sourcemap: true
+        External: ["@aws-sdk/*"]
+        Banner:
+          - js=import { createRequire } from 'module'; const require = createRequire(import.meta.url);
+
+  # Does the actual review: fetch diff, call Claude, post the review.
+  ReviewWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./
+      Handler: worker.handler
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          ANTHROPIC_MODEL: !Ref AnthropicModel
+      Policies:
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref BotSecret
+      Events:
+        ReviewJobs:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ReviewQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes: [ReportBatchItemFailures]
+            ScalingConfig:
+              MaximumConcurrency: 5 # caps parallel reviews, which also caps API spend and rate-limit pressure
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints: [src/worker.ts]
+        Format: esm
+        OutExtension: [.js=.mjs]
+        Target: es2022
+        Sourcemap: true
+        External: ["@aws-sdk/*"]
+        Banner:
+          - js=import { createRequire } from 'module'; const require = createRequire(import.meta.url);
+
+  WebhookLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${WebhookFunction}
+      RetentionInDays: 14
+
+  WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ReviewWorkerFunction}
+      RetentionInDays: 14
+
+  # Fires when any review has failed 3 times. Attach an SNS topic to AlarmActions to get emailed.
+  DeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Code reviews are failing and landing in the dead-letter queue
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ReviewDeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  WebhookUrl:
+    Description: Paste this into your GitHub App's Webhook URL field
+    Value: !GetAtt WebhookFunctionUrl.FunctionUrl
+  SecretArn:
+    Description: Secret to fill with your credentials
+    Value: !Ref BotSecret
+  DeadLetterQueueUrl:
+    Description: Failed review jobs end up here
+    Value: !Ref ReviewDeadLetterQueue
