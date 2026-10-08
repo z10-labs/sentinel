@@ -34,11 +34,13 @@ All credentials live in one Secrets Manager secret (`githubAppId`, `githubPrivat
 - Deployed 2026-10-08 as stack `sentinel-test` (us-east-1). GitHub App `sentinel-by-z10` is installed on
   `Dzithendo31/payme`; it reviewed test PR #12 end to end (4 inline comments, ~9s model time).
 - Secret-filling and smoke-test steps: `DEPLOY-TEST.md`. General setup: README.md.
-- No automated tests yet. Good first task: add unit tests (e.g. vitest) for `diff.ts`, `isValidSignature`,
-  `partitionComments`, and the response parsing in `reviewer.ts`.
-- Not done: the DLQ alarm has no `AlarmActions` (no notifications); no refusal fallbacks on the Claude call.
+- Unit tests (vitest, `test/`) cover the pure logic; handlers, Octokit and the Claude call are untested (need mocks).
+  CI (`.github/workflows/ci.yml`) runs typecheck + tests; it does not run `sam build`.
+- DLQ alarm notifies an SNS topic; email only if deployed with `--parameter-overrides AlarmEmail=...`.
+- Refusal / `max_tokens` / context-window stops post a "couldn't review" notice and are not retried; other
+  errors (incl. 4xx) still retry via SQS. Not done: API-level refusal fallback to another model.
 
 ## Commands
-- `npm install && npm run typecheck`
+- `npm install && npm run typecheck && npm test`
 - `sam build && sam deploy` (settings saved in `samconfig.toml`, which is gitignored)
 - `sam logs -n ReviewWorkerFunction --stack-name sentinel-test --tail`
