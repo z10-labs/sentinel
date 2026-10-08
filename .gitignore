@@ -5,3 +5,4 @@ samconfig.toml
 .DS_Store
 .env
 .env.*
+coverage/

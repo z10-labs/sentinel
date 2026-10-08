@@ -99,7 +99,7 @@ function isReviewComment(value: unknown): value is ReviewComment {
   );
 }
 
-function parseReviewResult(input: unknown): ReviewResult {
+export function parseReviewResult(input: unknown): ReviewResult {
   const candidate = (input ?? {}) as Record<string, unknown>;
   if (typeof candidate.summary !== "string") throw new Error("Model response is missing a summary");
   const comments = Array.isArray(candidate.comments) ? candidate.comments.filter(isReviewComment) : [];
@@ -117,12 +117,23 @@ export async function requestReview(input: ReviewInput): Promise<ReviewResult> {
     messages: [{ role: "user", content: buildPrompt(input) }],
   });
 
+  return parseModelResponse(response);
+}
+
+/** The parts of a Messages API response that review parsing relies on. */
+export interface ModelResponse {
+  readonly stop_reason: string | null;
+  readonly content: readonly { readonly type: string; readonly text?: string }[];
+}
+
+/** Validates that the model finished, then extracts and validates the JSON review from its text blocks. */
+export function parseModelResponse(response: ModelResponse): ReviewResult {
   if (response.stop_reason !== "end_turn") {
     throw new Error(`Model did not finish the review (stop_reason: ${response.stop_reason})`);
   }
   const text = response.content
-    .filter((block): block is Anthropic.TextBlock => block.type === "text")
-    .map((block) => block.text)
+    .filter((block) => block.type === "text")
+    .map((block) => block.text ?? "")
     .join("");
 
   return parseReviewResult(JSON.parse(text));
