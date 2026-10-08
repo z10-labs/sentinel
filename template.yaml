@@ -7,6 +7,13 @@ Parameters:
     Type: String
     Default: claude-sonnet-5-5
     Description: Claude model used for reviews
+  AlarmEmail:
+    Type: String
+    Default: ""
+    Description: Optional email address notified when reviews land in the dead-letter queue. Leave empty for no email subscription.
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
 
 Globals:
   Function:
@@ -118,7 +125,22 @@ Resources:
       LogGroupName: !Sub /aws/lambda/${ReviewWorkerFunction}
       RetentionInDays: 14
 
-  # Fires when any review has failed 3 times. Attach an SNS topic to AlarmActions to get emailed.
+  # Receives DLQ alarm state changes. Subscribe extra endpoints (Slack, PagerDuty, ...) to this topic as needed.
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: Sentinel review failures
+
+  # Only created when AlarmEmail is set. AWS emails a confirmation link that must be clicked before delivery starts.
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  # Fires when any review has failed 3 times; notifies AlarmTopic on ALARM and again on recovery (OK).
   DeadLetterAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -134,6 +156,10 @@ Resources:
       Threshold: 0
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+      OKActions:
+        - !Ref AlarmTopic
 
 Outputs:
   WebhookUrl:
@@ -145,3 +171,6 @@ Outputs:
   DeadLetterQueueUrl:
     Description: Failed review jobs end up here
     Value: !Ref ReviewDeadLetterQueue
+  AlarmTopicArn:
+    Description: SNS topic notified when the dead-letter queue alarm changes state
+    Value: !Ref AlarmTopic

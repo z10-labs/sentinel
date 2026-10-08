@@ -87,3 +87,23 @@ Warm Lambda containers cache the secret once it loads successfully. An empty or 
 cached, so filling it in takes effect right away. But if you correct a *wrong* value (for example a webhook secret
 that doesn't match the app), warm containers keep using the old one. Force fresh containers by changing an
 environment variable on both functions or redeploying with a changed template.
+
+## 6. Get emailed when reviews fail (optional)
+
+The dead-letter-queue alarm publishes to an SNS topic (`AlarmTopicArn` output). To add an email subscription:
+
+```bash
+sam build && sam deploy --parameter-overrides AlarmEmail=you@example.com
+```
+
+Then open the "AWS Notification - Subscription Confirmation" email and click **Confirm subscription**.
+Until you do, the subscription stays "PendingConfirmation" and no alerts are sent. Check it with:
+
+```bash
+aws sns list-subscriptions-by-topic --region us-east-1 --topic-arn "$(aws cloudformation describe-stacks \
+  --region us-east-1 --stack-name sentinel-test \
+  --query "Stacks[0].Outputs[?OutputKey=='AlarmTopicArn'].OutputValue" --output text)"
+```
+
+Later `sam deploy` runs without `--parameter-overrides` keep the stack's previous `AlarmEmail`. To stop the emails,
+deploy with `--parameter-overrides AlarmEmail=""`. Changing the address creates a new subscription to confirm.
