@@ -22,6 +22,22 @@ export interface ReviewResult {
   readonly comments: readonly ReviewComment[];
 }
 
+/** Why a review can never succeed for this commit, so retrying would only cost money. */
+export type UnreviewableReason = "refusal" | "max_tokens" | "context_window_exceeded";
+
+/**
+ * Outcome of one review request. Transient failures (network, timeouts, 429, 5xx/overloaded)
+ * are thrown instead, so SQS retries them.
+ */
+export type ReviewOutcome =
+  | { readonly kind: "reviewed"; readonly review: ReviewResult }
+  | {
+      readonly kind: "unreviewable";
+      readonly reason: UnreviewableReason;
+      readonly stopReason: string;
+      readonly refusalCategory: string | null;
+    };
+
 /** A changed file prepared for the model, with the lines GitHub will accept comments on. */
 export interface DiffFile {
   readonly path: string;

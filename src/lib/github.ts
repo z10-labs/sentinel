@@ -2,7 +2,7 @@ import { App, type Octokit } from "octokit";
 import { loadSecrets } from "./config.js";
 import type { ChangedFile } from "./diff.js";
 import { logger } from "./logger.js";
-import type { DiffFile, ReviewComment, ReviewJob, Severity } from "./types.js";
+import type { DiffFile, ReviewComment, ReviewJob, Severity, UnreviewableReason } from "./types.js";
 
 const MAX_INLINE_COMMENTS = 20;
 const HTTP_UNPROCESSABLE = 422;
@@ -102,6 +102,36 @@ function buildReviewBody(params: {
   ]
     .filter(Boolean)
     .join("\n\n");
+}
+
+const UNREVIEWABLE_EXPLANATIONS: Record<UnreviewableReason, string> = {
+  refusal: "the model declined to review this diff.",
+  max_tokens: "the review ran past the model's output limit.",
+  context_window_exceeded: "the diff is too large for the model's context window.",
+};
+
+/** Body of the notice posted when a PR can't be reviewed. Carries the marker so redelivery doesn't repost. */
+export function buildUnreviewableBody(reason: UnreviewableReason, headSha: string): string {
+  return [
+    "## 🤖 Automated review",
+    `Sentinel couldn't review this PR: ${UNREVIEWABLE_EXPLANATIONS[reason]} It won't retry for this commit; a new push will trigger a fresh attempt.`,
+    reviewMarker(headSha),
+  ].join("\n\n");
+}
+
+export async function postUnreviewableNotice(
+  octokit: Octokit,
+  job: ReviewJob,
+  reason: UnreviewableReason,
+): Promise<void> {
+  await octokit.rest.pulls.createReview({
+    owner: job.owner,
+    repo: job.repo,
+    pull_number: job.pullNumber,
+    commit_id: job.headSha,
+    event: "COMMENT",
+    body: buildUnreviewableBody(reason, job.headSha),
+  });
 }
 
 export async function postReview(
