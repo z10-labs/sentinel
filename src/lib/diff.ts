@@ -50,27 +50,98 @@ export function analyzePatch(patch: string): { annotatedPatch: string; commentab
   return { annotatedPatch: annotated.join("\n"), commentableLines };
 }
 
-/** Picks the files worth reviewing, staying within the character budget. */
+/**
+ * Budget priority, lowest first. When a PR is bigger than MAX_DIFF_CHARS the budget goes to the
+ * files a reviewer most needs: the logic itself, then the data model it relies on, then config,
+ * then tests, and generated artifacts only if room is left.
+ */
+export const FILE_TIER = {
+  source: 0,
+  schema: 1,
+  config: 2,
+  test: 3,
+  generated: 4,
+} as const;
+
+export type FileTier = (typeof FILE_TIER)[keyof typeof FILE_TIER];
+
+/** Machine-written files that are large and add little review signal (API contracts, ORM snapshots, codegen). */
+const GENERATED_PATH_PATTERNS: readonly RegExp[] = [
+  /(^|\/)(openapi|swagger)\.(json|ya?ml)$/,
+  /(^|\/)meta\/(_journal|\d+_snapshot)\.json$/,
+  /\.(generated|gen)\.[^/]+$/,
+  /(_pb2\.py|\.pb\.go)$/,
+];
+
+const TEST_PATH_PATTERNS: readonly RegExp[] = [
+  /(^|\/)(test|tests|__tests__|__mocks__|spec|e2e|fixtures)\//,
+  /\.(test|spec)\.[^/]+$/,
+  /_test\.(go|py)$/,
+  /(^|\/)test_[^/]+\.py$/,
+];
+
+const SCHEMA_PATH_PATTERNS: readonly RegExp[] = [
+  /\.(sql|prisma|graphql|gql|proto)$/,
+  /(^|\/)migrations?\//,
+  /(^|\/)schemas?(\/|\.[^/]+$)/,
+];
+
+const CONFIG_PATH_PATTERNS: readonly RegExp[] = [
+  /^\.github\//,
+  /(^|\/)\.[^/]+$/,
+  /\.(json|ya?ml|toml|ini|cfg|conf|md|txt)$/,
+  /(^|\/)(Dockerfile|Makefile|Procfile)[^/]*$/,
+];
+
+const matchesAny = (patterns: readonly RegExp[], path: string): boolean =>
+  patterns.some((pattern) => pattern.test(path));
+
+/** Classifies a path into a budget tier. Checked from most to least specific, so a SQL test fixture counts as a test. */
+export function rankFile(path: string): FileTier {
+  if (matchesAny(GENERATED_PATH_PATTERNS, path)) return FILE_TIER.generated;
+  if (matchesAny(TEST_PATH_PATTERNS, path)) return FILE_TIER.test;
+  if (matchesAny(SCHEMA_PATH_PATTERNS, path)) return FILE_TIER.schema;
+  if (matchesAny(CONFIG_PATH_PATTERNS, path)) return FILE_TIER.config;
+  return FILE_TIER.source;
+}
+
+interface RankedCandidate {
+  readonly order: number;
+  readonly tier: FileTier;
+  readonly file: DiffFile;
+}
+
+/**
+ * Picks the files worth reviewing, staying within the character budget. The budget is spent in
+ * tier order (see FILE_TIER), but both lists come back in GitHub's original order so the prompt
+ * stays stable and reads like the PR.
+ */
 export function selectReviewableFiles(files: readonly ChangedFile[]): {
   included: DiffFile[];
   skipped: string[];
 } {
-  const initial = { included: [] as DiffFile[], skipped: [] as string[], usedChars: 0 };
-
-  const selection = files.reduce((acc, file) => {
-    const isCandidate = file.status !== "removed" && file.patch !== undefined && isReviewablePath(file.filename);
-    if (!isCandidate || file.patch === undefined) return acc;
-
+  const candidates = files.flatMap((file, order): RankedCandidate[] => {
+    if (file.status === "removed" || file.patch === undefined || !isReviewablePath(file.filename)) return [];
     const { annotatedPatch, commentableLines } = analyzePatch(file.patch);
-    if (acc.usedChars + annotatedPatch.length > MAX_DIFF_CHARS) {
-      return { ...acc, skipped: [...acc.skipped, file.filename] };
+    return [{ order, tier: rankFile(file.filename), file: { path: file.filename, annotatedPatch, commentableLines } }];
+  });
+
+  const byPriority = [...candidates].sort((a, b) => a.tier - b.tier || a.order - b.order);
+  const initial = { included: [] as RankedCandidate[], skipped: [] as RankedCandidate[], usedChars: 0 };
+
+  const selection = byPriority.reduce((acc, candidate) => {
+    const size = candidate.file.annotatedPatch.length;
+    if (acc.usedChars + size > MAX_DIFF_CHARS) {
+      return { ...acc, skipped: [...acc.skipped, candidate] };
     }
-    return {
-      included: [...acc.included, { path: file.filename, annotatedPatch, commentableLines }],
-      skipped: acc.skipped,
-      usedChars: acc.usedChars + annotatedPatch.length,
-    };
+    return { ...acc, included: [...acc.included, candidate], usedChars: acc.usedChars + size };
   }, initial);
 
-  return { included: selection.included, skipped: selection.skipped };
+  const inOriginalOrder = (list: readonly RankedCandidate[]): RankedCandidate[] =>
+    [...list].sort((a, b) => a.order - b.order);
+
+  return {
+    included: inOriginalOrder(selection.included).map((candidate) => candidate.file),
+    skipped: inOriginalOrder(selection.skipped).map((candidate) => candidate.file.path),
+  };
 }

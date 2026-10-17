@@ -23,6 +23,8 @@ All credentials live in one Secrets Manager secret (`githubAppId`, `githubPrivat
 ## Design decisions (keep unless asked)
 - Webhook only enqueues; all slow work happens in the worker.
 - Stale jobs (head SHA changed) are skipped; a hidden `<!-- review-bot:<sha> -->` marker prevents duplicate reviews on SQS redelivery.
+- When a PR exceeds the 60k-char diff budget, files are ranked (source > schema/migrations > config/CI > tests >
+  generated contracts/snapshots) before the budget is spent; the prompt still lists files in GitHub's order.
 - Comments whose lines GitHub won't accept go into the summary instead of being dropped.
 - Structured outputs, not forced tool use: current models (incl. `claude-sonnet-5-5`) return a 400 for
   `tool_choice` `tool`/`any`. Thinking is always on and shares `max_tokens` with the JSON, so keep that budget

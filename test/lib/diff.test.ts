@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { analyzePatch, isReviewablePath, MAX_DIFF_CHARS, selectReviewableFiles } from "../../src/lib/diff.js";
+import {
+  analyzePatch,
+  FILE_TIER,
+  isReviewablePath,
+  MAX_DIFF_CHARS,
+  rankFile,
+  selectReviewableFiles,
+} from "../../src/lib/diff.js";
 
 describe("isReviewablePath", () => {
   it.each(["src/index.ts", "README.md", "docs/distribution/notes.md", "src/builder/build.ts"])(
@@ -149,5 +156,124 @@ describe("selectReviewableFiles", () => {
     const snapshot = structuredClone(files);
     selectReviewableFiles(files);
     expect(files).toEqual(snapshot);
+  });
+});
+
+describe("rankFile", () => {
+  it.each([
+    ["modules/scheduling/application/ratings.ts", FILE_TIER.source],
+    ["modules/scheduling/domain/session-rating.ts", FILE_TIER.source],
+    ["src/index.ts", FILE_TIER.source],
+    ["drizzle/0006_session_ratings.sql", FILE_TIER.schema],
+    ["db/migrations/20261017_add_index.ts", FILE_TIER.schema],
+    ["src/db/schema.ts", FILE_TIER.schema],
+    ["src/db/schema/ratings.ts", FILE_TIER.schema],
+    ["prisma/schema.prisma", FILE_TIER.schema],
+    [".github/workflows/ci.yml", FILE_TIER.config],
+    ["package.json", FILE_TIER.config],
+    ["tsconfig.json", FILE_TIER.config],
+    [".env.example", FILE_TIER.config],
+    ["Dockerfile", FILE_TIER.config],
+    ["README.md", FILE_TIER.config],
+    ["test/ratings.test.ts", FILE_TIER.test],
+    ["src/ratings.spec.ts", FILE_TIER.test],
+    ["modules/scheduling/__tests__/ratings.ts", FILE_TIER.test],
+    ["pkg/rate_test.go", FILE_TIER.test],
+    ["tests/test_rate.py", FILE_TIER.test],
+    ["test/fixtures/seed.sql", FILE_TIER.test],
+    ["contract/openapi.json", FILE_TIER.generated],
+    ["api/swagger.yaml", FILE_TIER.generated],
+    ["drizzle/meta/_journal.json", FILE_TIER.generated],
+    ["drizzle/meta/0006_snapshot.json", FILE_TIER.generated],
+    ["src/client.generated.ts", FILE_TIER.generated],
+    ["proto/rate.pb.go", FILE_TIER.generated],
+  ])("ranks %s as tier %i", (path, tier) => {
+    expect(rankFile(path)).toBe(tier);
+  });
+
+  it("does not treat lookalike names as tests or schemas", () => {
+    expect(rankFile("src/testimonials.ts")).toBe(FILE_TIER.source);
+    expect(rankFile("src/latest.ts")).toBe(FILE_TIER.source);
+    expect(rankFile("src/schemaless.ts")).toBe(FILE_TIER.source);
+  });
+});
+
+describe("selectReviewableFiles ranking", () => {
+  const patchOfSize = (chars: number): string => `@@ -1 +1 @@\n+${"x".repeat(chars)}`;
+  // Each "big" file uses well over half the budget, so only one of them can ever fit.
+  const big = patchOfSize(Math.ceil(MAX_DIFF_CHARS * 0.6));
+  const small = patchOfSize(100);
+
+  it("spends the budget on source before a large generated contract that sorts first", () => {
+    const { included, skipped } = selectReviewableFiles([
+      { filename: "contract/openapi.json", status: "modified", patch: big },
+      { filename: "modules/scheduling/application/ratings.ts", status: "added", patch: big },
+    ]);
+
+    expect(included.map((f) => f.path)).toEqual(["modules/scheduling/application/ratings.ts"]);
+    expect(skipped).toEqual(["contract/openapi.json"]);
+  });
+
+  it("reproduces the PR #41 shape: generated contract and tests no longer push out source and migrations", () => {
+    const sourceChars = Math.floor(MAX_DIFF_CHARS * 0.3);
+    const testChars = Math.floor(MAX_DIFF_CHARS * 0.4);
+    const { included, skipped } = selectReviewableFiles([
+      { filename: "contract/openapi.json", status: "modified", patch: big },
+      { filename: "drizzle/0006_session_ratings.sql", status: "added", patch: small },
+      { filename: "drizzle/meta/0006_snapshot.json", status: "added", patch: big },
+      { filename: "drizzle/meta/_journal.json", status: "modified", patch: small },
+      { filename: "modules/scheduling/application/ratings.ts", status: "added", patch: patchOfSize(sourceChars) },
+      { filename: "modules/scheduling/domain/session-rating.ts", status: "added", patch: small },
+      { filename: "modules/scheduling/test/ratings.test.ts", status: "added", patch: patchOfSize(testChars) },
+      { filename: "modules/scheduling/test/session-rating.test.ts", status: "added", patch: patchOfSize(testChars) },
+    ]);
+
+    const includedPaths = included.map((f) => f.path);
+    expect(includedPaths).toContain("modules/scheduling/application/ratings.ts");
+    expect(includedPaths).toContain("modules/scheduling/domain/session-rating.ts");
+    expect(includedPaths).toContain("drizzle/0006_session_ratings.sql");
+    expect(skipped).toContain("contract/openapi.json");
+    expect(skipped).toContain("drizzle/meta/0006_snapshot.json");
+    // Only one 40% test file fits after the 30% source file; the second is skipped rather than any source file.
+    expect(includedPaths).toContain("modules/scheduling/test/ratings.test.ts");
+    expect(skipped).toContain("modules/scheduling/test/session-rating.test.ts");
+  });
+
+  it("fills tiers in order: source, schema, config, test, generated", () => {
+    // Each file takes a quarter of the budget, so exactly four of the five fit.
+    const quarter = patchOfSize(Math.floor(MAX_DIFF_CHARS / 4) - 20);
+    const { included, skipped } = selectReviewableFiles([
+      { filename: "a/openapi.json", status: "modified", patch: quarter },
+      { filename: "b.test.ts", status: "modified", patch: quarter },
+      { filename: "c/package.json", status: "modified", patch: quarter },
+      { filename: "d/0001_init.sql", status: "modified", patch: quarter },
+      { filename: "e/service.ts", status: "modified", patch: quarter },
+    ]);
+
+    expect(skipped).toEqual(["a/openapi.json"]);
+    expect(included.map((f) => f.path)).toEqual(["b.test.ts", "c/package.json", "d/0001_init.sql", "e/service.ts"]);
+  });
+
+  it("returns included and skipped files in the original PR order, not ranking order", () => {
+    const { included, skipped } = selectReviewableFiles([
+      { filename: "z/openapi.json", status: "modified", patch: big },
+      { filename: "b.test.ts", status: "modified", patch: small },
+      { filename: "a/schema.sql", status: "modified", patch: small },
+      { filename: "c/service.ts", status: "modified", patch: big },
+      { filename: "d/util.ts", status: "modified", patch: small },
+    ]);
+
+    expect(included.map((f) => f.path)).toEqual(["b.test.ts", "a/schema.sql", "c/service.ts", "d/util.ts"]);
+    expect(skipped).toEqual(["z/openapi.json"]);
+  });
+
+  it("keeps original order within a tier when spending the budget", () => {
+    const { included, skipped } = selectReviewableFiles([
+      { filename: "src/a.ts", status: "modified", patch: big },
+      { filename: "src/b.ts", status: "modified", patch: big },
+    ]);
+
+    expect(included.map((f) => f.path)).toEqual(["src/a.ts"]);
+    expect(skipped).toEqual(["src/b.ts"]);
   });
 });
