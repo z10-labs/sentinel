@@ -3,9 +3,11 @@ import { SendMessageCommand, SQSClient } from "@aws-sdk/client-sqs";
 import type { LambdaFunctionURLEvent, LambdaFunctionURLResult } from "aws-lambda";
 import { loadSecrets, requireEnv } from "./lib/config.js";
 import { logger } from "./lib/logger.js";
-import type { ReviewJob } from "./lib/types.js";
+import type { QueueJob, ReplyJob, ReviewJob } from "./lib/types.js";
 
 const REVIEWABLE_ACTIONS: ReadonlySet<string> = new Set(["opened", "synchronize", "reopened", "ready_for_review"]);
+/** Who may make the bot re-think a comment (besides the PR's author). Each reply costs a model call. */
+const TRUSTED_ASSOCIATIONS: ReadonlySet<string> = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
 const sqs = new SQSClient({});
 
 /** The parts of GitHub's pull_request webhook payload this bot uses. */
@@ -15,6 +17,23 @@ interface PullRequestPayload {
   repository: { name: string; owner: { login: string } };
   pull_request: { number: number; draft: boolean; head: { sha: string } };
 }
+
+/** The parts of GitHub's pull_request_review_comment webhook payload this bot uses. */
+export interface ReviewCommentPayload {
+  action: string;
+  installation?: { id: number };
+  repository: { name: string; owner: { login: string } };
+  pull_request: { number: number; user: { login: string } | null };
+  comment: {
+    id: number;
+    in_reply_to_id?: number;
+    author_association: string;
+    user: { login: string; type: string } | null;
+  };
+}
+
+/** Either a job to enqueue or the reason the event is ignored. */
+export type ReplyFilterResult = { readonly job: ReplyJob } | { readonly ignored: string };
 
 function respond(statusCode: number, message: string): LambdaFunctionURLResult {
   return { statusCode, headers: { "content-type": "application/json" }, body: JSON.stringify({ message }) };
@@ -37,6 +56,7 @@ export function isValidSignature(rawBody: string, signatureHeader: string | unde
 function toReviewJob(payload: PullRequestPayload, deliveryId: string): ReviewJob | undefined {
   if (!payload.installation) return undefined;
   return {
+    kind: "review",
     deliveryId,
     installationId: payload.installation.id,
     owner: payload.repository.owner.login,
@@ -44,6 +64,66 @@ function toReviewJob(payload: PullRequestPayload, deliveryId: string): ReviewJob
     pullNumber: payload.pull_request.number,
     headSha: payload.pull_request.head.sha,
   };
+}
+
+/** Turns a review-comment event into a reply job, if it's a human replying in a thread. */
+export function toReplyJob(payload: ReviewCommentPayload, deliveryId: string): ReplyFilterResult {
+  const { comment } = payload;
+  if (payload.action !== "created") return { ignored: `action ${payload.action}` };
+  if (comment.in_reply_to_id === undefined) return { ignored: "not a reply" };
+  // Never answer bots, including this one; otherwise two bots could talk forever.
+  if (!comment.user || comment.user.type === "Bot") return { ignored: "author is a bot" };
+
+  const isPullRequestAuthor = comment.user.login === payload.pull_request.user?.login;
+  if (!isPullRequestAuthor && !TRUSTED_ASSOCIATIONS.has(comment.author_association)) {
+    return { ignored: `untrusted author association ${comment.author_association}` };
+  }
+  if (!payload.installation) return { ignored: "no installation id" };
+
+  return {
+    job: {
+      kind: "reply",
+      deliveryId,
+      installationId: payload.installation.id,
+      owner: payload.repository.owner.login,
+      repo: payload.repository.name,
+      pullNumber: payload.pull_request.number,
+      commentId: comment.id,
+      inReplyToId: comment.in_reply_to_id,
+    },
+  };
+}
+
+function parsePayload<T>(rawBody: string): T | undefined {
+  try {
+    return JSON.parse(rawBody) as T;
+  } catch {
+    return undefined;
+  }
+}
+
+async function enqueue(job: QueueJob): Promise<void> {
+  await sqs.send(new SendMessageCommand({ QueueUrl: requireEnv("QUEUE_URL"), MessageBody: JSON.stringify(job) }));
+  logger.info("Queued job", { ...job });
+}
+
+/** A webhook either yields a job to enqueue or is answered straight away. */
+type Routed = { readonly job: QueueJob } | { readonly response: LambdaFunctionURLResult };
+
+function handlePullRequest(rawBody: string, deliveryId: string): Routed {
+  const payload = parsePayload<PullRequestPayload>(rawBody);
+  if (!payload) return { response: respond(400, "invalid JSON") };
+  if (!REVIEWABLE_ACTIONS.has(payload.action)) return { response: respond(202, `ignored action ${payload.action}`) };
+  if (payload.pull_request.draft) return { response: respond(202, "ignored draft PR") };
+  const job = toReviewJob(payload, deliveryId);
+  return job ? { job } : { response: respond(400, "payload has no installation id") };
+}
+
+function handleReviewComment(rawBody: string, deliveryId: string): Routed {
+  const payload = parsePayload<ReviewCommentPayload>(rawBody);
+  if (!payload) return { response: respond(400, "invalid JSON") };
+  const result = toReplyJob(payload, deliveryId);
+  return "job" in result ? result : { response: respond(202, `ignored: ${result.ignored}`) };
 }
 
 /**
@@ -62,22 +142,13 @@ export async function handler(event: LambdaFunctionURLEvent): Promise<LambdaFunc
   }
 
   if (eventName === "ping") return respond(200, "pong");
-  if (eventName !== "pull_request") return respond(202, `ignored event ${eventName}`);
 
-  let payload: PullRequestPayload;
-  try {
-    payload = JSON.parse(rawBody) as PullRequestPayload;
-  } catch {
-    return respond(400, "invalid JSON");
-  }
+  let routed: Routed;
+  if (eventName === "pull_request") routed = handlePullRequest(rawBody, deliveryId);
+  else if (eventName === "pull_request_review_comment") routed = handleReviewComment(rawBody, deliveryId);
+  else return respond(202, `ignored event ${eventName}`);
 
-  if (!REVIEWABLE_ACTIONS.has(payload.action)) return respond(202, `ignored action ${payload.action}`);
-  if (payload.pull_request.draft) return respond(202, "ignored draft PR");
-
-  const job = toReviewJob(payload, deliveryId);
-  if (!job) return respond(400, "payload has no installation id");
-
-  await sqs.send(new SendMessageCommand({ QueueUrl: requireEnv("QUEUE_URL"), MessageBody: JSON.stringify(job) }));
-  logger.info("Queued review", { ...job });
+  if ("response" in routed) return routed.response;
+  await enqueue(routed.job);
   return respond(202, "queued");
 }

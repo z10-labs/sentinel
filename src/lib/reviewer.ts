@@ -1,19 +1,17 @@
-import Anthropic from "@anthropic-ai/sdk";
-import { loadSecrets } from "./config.js";
-import type {
-  DiffFile,
-  ReviewComment,
-  ReviewOutcome,
-  ReviewResult,
-  Severity,
-  UnreviewableReason,
-} from "./types.js";
+import {
+  buildSystem,
+  classifyStopReason,
+  getClient,
+  MAX_OUTPUT_TOKENS,
+  type ModelResponse,
+  modelId,
+  parseStructuredResponse,
+} from "./claude.js";
+import type { RepoGuidance } from "./guidance.js";
+import type { DiffFile, ReviewComment, ReviewOutcome, ReviewResult, Severity } from "./types.js";
 
-const DEFAULT_MODEL = "claude-sonnet-5-5";
-// Thinking is always on for current models and shares this budget with the JSON answer.
-const MAX_OUTPUT_TOKENS = 16_000;
-// Leaves headroom under the worker's 300s Lambda timeout, so a slow call fails cleanly and is retried.
-const REQUEST_TIMEOUT_MS = 240_000;
+export { classifyStopReason, type ModelResponse };
+
 const MAX_DESCRIPTION_CHARS = 4000;
 const SEVERITIES: readonly Severity[] = ["critical", "warning", "suggestion"];
 
@@ -62,16 +60,7 @@ export interface ReviewInput {
   readonly description: string;
   readonly files: readonly DiffFile[];
   readonly skippedFiles: readonly string[];
-}
-
-let cachedClient: Anthropic | undefined;
-
-async function getClient(): Promise<Anthropic> {
-  if (!cachedClient) {
-    const { anthropicApiKey } = await loadSecrets();
-    cachedClient = new Anthropic({ apiKey: anthropicApiKey, maxRetries: 3, timeout: REQUEST_TIMEOUT_MS });
-  }
-  return cachedClient;
+  readonly guidance?: RepoGuidance;
 }
 
 function buildPrompt(input: ReviewInput): string {
@@ -113,34 +102,15 @@ export function parseReviewResult(input: unknown): ReviewResult {
   return { summary: candidate.summary, comments };
 }
 
-/**
- * Maps a stop_reason to a permanent failure, or undefined if it isn't one.
- * - refusal: the safety classifier declined this input; the same diff gets the same answer.
- * - max_tokens: we already send the full output budget, so a retry repeats the same cut-off.
- * - model_context_window_exceeded: the input itself is too large; nothing changes on retry.
- */
-export function classifyStopReason(stopReason: string | null): UnreviewableReason | undefined {
-  switch (stopReason) {
-    case "refusal":
-      return "refusal";
-    case "max_tokens":
-      return "max_tokens";
-    case "model_context_window_exceeded":
-      return "context_window_exceeded";
-    default:
-      return undefined;
-  }
-}
-
 /** Sends the diff to Claude and returns a structured review, or why this PR can't be reviewed. */
 export async function requestReview(input: ReviewInput): Promise<ReviewOutcome> {
   const client = await getClient();
   // SDK errors (connection, timeout, 429, 5xx/overloaded) propagate after the client's own retries,
   // so SQS retries the job.
   const response = await client.messages.create({
-    model: process.env.ANTHROPIC_MODEL || DEFAULT_MODEL,
+    model: modelId(),
     max_tokens: MAX_OUTPUT_TOKENS,
-    system: SYSTEM_PROMPT,
+    system: buildSystem(SYSTEM_PROMPT, input.guidance),
     output_config: { format: { type: "json_schema", schema: REVIEW_SCHEMA } },
     messages: [{ role: "user", content: buildPrompt(input) }],
   });
@@ -148,35 +118,11 @@ export async function requestReview(input: ReviewInput): Promise<ReviewOutcome> 
   return parseModelResponse(response);
 }
 
-/** The parts of a Messages API response that review parsing relies on. */
-export interface ModelResponse {
-  readonly stop_reason: string | null;
-  readonly stop_details?: { readonly category?: string | null } | null;
-  readonly content: readonly { readonly type: string; readonly text?: string }[];
-}
-
 /**
  * Turns a model response into a review, or into a permanent "can't review" outcome.
  * Throws for unexpected stop reasons and bad JSON, so those are retried and stay visible.
  */
 export function parseModelResponse(response: ModelResponse): ReviewOutcome {
-  const unreviewable = classifyStopReason(response.stop_reason);
-  if (unreviewable) {
-    return {
-      kind: "unreviewable",
-      reason: unreviewable,
-      stopReason: String(response.stop_reason),
-      refusalCategory: response.stop_details?.category ?? null,
-    };
-  }
-  // Anything else other than end_turn is unexpected for this request shape; throw so it stays visible.
-  if (response.stop_reason !== "end_turn") {
-    throw new Error(`Model did not finish the review (stop_reason: ${response.stop_reason})`);
-  }
-  const text = response.content
-    .filter((block) => block.type === "text")
-    .map((block) => block.text ?? "")
-    .join("");
-
-  return { kind: "reviewed", review: parseReviewResult(JSON.parse(text)) };
+  const outcome = parseStructuredResponse(response, parseReviewResult, "review");
+  return outcome.kind === "ok" ? { kind: "reviewed", review: outcome.value } : outcome;
 }

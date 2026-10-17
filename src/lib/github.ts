@@ -29,6 +29,26 @@ export async function getInstallationClient(installationId: number): Promise<Oct
   return app.getInstallationOctokit(installationId);
 }
 
+let cachedBotLogin: Promise<string> | undefined;
+
+/** The login the app comments as, e.g. "sentinel-by-z10[bot]". Used to recognise its own comments. */
+export function getBotLogin(): Promise<string> {
+  if (!cachedBotLogin) {
+    cachedBotLogin = fetchBotLogin().catch((error: unknown) => {
+      cachedBotLogin = undefined; // don't cache a failure
+      throw error;
+    });
+  }
+  return cachedBotLogin;
+}
+
+async function fetchBotLogin(): Promise<string> {
+  const app = await getApp();
+  const { data } = await app.octokit.rest.apps.getAuthenticated();
+  if (!data?.slug) throw new Error("GitHub did not return the app's slug");
+  return `${data.slug}[bot]`;
+}
+
 /** Hidden marker in the review body so a retried job doesn't post a second review for the same commit. */
 function reviewMarker(headSha: string): string {
   return `<!-- review-bot:${headSha} -->`;
