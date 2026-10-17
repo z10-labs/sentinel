@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { partitionComments } from "../../src/lib/github.js";
+import { buildReviewBody, partitionComments, severityFromBody } from "../../src/lib/github.js";
 import type { DiffFile, ReviewComment } from "../../src/lib/types.js";
 
 const MAX_INLINE_COMMENTS = 20; // mirrors the private limit in github.ts
@@ -70,5 +70,34 @@ describe("partitionComments", () => {
     const snapshot = [...comments];
     partitionComments(comments, [file("a.ts", [1])]);
     expect(comments).toEqual(snapshot);
+  });
+});
+
+describe("severityFromBody", () => {
+  it("reads the severity from the comment label", () => {
+    expect(severityFromBody("🔴 **Critical**: x")).toBe("critical");
+    expect(severityFromBody("🟠 **Warning**: x")).toBe("warning");
+    expect(severityFromBody("🔵 **Suggestion**: x")).toBe("suggestion");
+    expect(severityFromBody("plain text")).toBeUndefined();
+  });
+});
+
+describe("buildReviewBody", () => {
+  const sha = "c".repeat(40);
+
+  it("strips HTML comments from the model's summary so it can't forge a marker", () => {
+    const body = buildReviewBody({
+      summary: `ok <!-- review-bot:${"d".repeat(40)} --> done`,
+      general: [],
+      skippedFiles: [],
+      headSha: sha,
+    });
+    expect(body).not.toContain("d".repeat(40));
+    expect(body.trimEnd().endsWith(`<!-- review-bot:${sha} -->`)).toBe(true);
+  });
+
+  it("notes the commit a follow-up review starts from", () => {
+    const body = buildReviewBody({ summary: "s", general: [], skippedFiles: [], headSha: sha, sinceSha: "e".repeat(40) });
+    expect(body).toContain("Follow-up review: changes since `eeeeeee`");
   });
 });

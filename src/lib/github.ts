@@ -2,7 +2,15 @@ import { App, type Octokit } from "octokit";
 import { loadSecrets } from "./config.js";
 import type { ChangedFile } from "./diff.js";
 import { logger } from "./logger.js";
-import type { DiffFile, ReviewComment, ReviewJob, Severity, UnreviewableReason } from "./types.js";
+import type {
+  DiffFile,
+  PostedReview,
+  PullReview,
+  ReviewComment,
+  ReviewJob,
+  Severity,
+  UnreviewableReason,
+} from "./types.js";
 
 const MAX_INLINE_COMMENTS = 20;
 const HTTP_UNPROCESSABLE = 422;
@@ -12,6 +20,10 @@ const SEVERITY_LABELS: Record<Severity, string> = {
   warning: "🟠 **Warning**",
   suggestion: "🔵 **Suggestion**",
 };
+
+const SEVERITIES: readonly Severity[] = ["critical", "warning", "suggestion"];
+/** HTML comments in model text would be invisible on GitHub and could forge the review marker. */
+const HTML_COMMENT_PATTERN = /<!--[\s\S]*?-->/g;
 
 let cachedApp: App | undefined;
 
@@ -54,14 +66,21 @@ function reviewMarker(headSha: string): string {
   return `<!-- review-bot:${headSha} -->`;
 }
 
-export async function hasExistingReview(octokit: Octokit, job: ReviewJob): Promise<boolean> {
-  const reviews = await octokit.paginate(octokit.rest.pulls.listReviews, {
+/** Start of the notice posted when a PR can't be reviewed; lets later jobs tell it apart from a real review. */
+export const UNREVIEWABLE_PREFIX = "Sentinel couldn't review this PR";
+
+export async function listReviews(octokit: Octokit, job: ReviewJob): Promise<PullReview[]> {
+  return octokit.paginate(octokit.rest.pulls.listReviews, {
     owner: job.owner,
     repo: job.repo,
     pull_number: job.pullNumber,
     per_page: 100,
   });
-  const marker = reviewMarker(job.headSha);
+}
+
+/** True when a review (or "couldn't review" notice) for this exact commit is already on the PR. */
+export function hasReviewForCommit(reviews: readonly PullReview[], headSha: string): boolean {
+  const marker = reviewMarker(headSha);
   return reviews.some((review) => review.body?.includes(marker));
 }
 
@@ -93,12 +112,18 @@ function formatComment(comment: ReviewComment): string {
   return `${SEVERITY_LABELS[comment.severity]}: ${comment.body}`;
 }
 
-function buildReviewBody(params: {
+const SHORT_SHA_LENGTH = 7;
+
+export function buildReviewBody(params: {
   summary: string;
   general: readonly ReviewComment[];
   skippedFiles: readonly string[];
   headSha: string;
+  sinceSha?: string;
 }): string {
+  const scopeNote = params.sinceSha
+    ? `_Follow-up review: changes since \`${params.sinceSha.slice(0, SHORT_SHA_LENGTH)}\`._`
+    : "";
   const generalSection =
     params.general.length > 0
       ? `### Other notes\n${params.general
@@ -114,7 +139,8 @@ function buildReviewBody(params: {
 
   return [
     "## 🤖 Automated review",
-    params.summary,
+    scopeNote,
+    params.summary.replace(HTML_COMMENT_PATTERN, ""),
     generalSection,
     skippedSection,
     "_Automated feedback. It can be wrong, so use your judgement._",
@@ -134,7 +160,7 @@ const UNREVIEWABLE_EXPLANATIONS: Record<UnreviewableReason, string> = {
 export function buildUnreviewableBody(reason: UnreviewableReason, headSha: string): string {
   return [
     "## 🤖 Automated review",
-    `Sentinel couldn't review this PR: ${UNREVIEWABLE_EXPLANATIONS[reason]} It won't retry for this commit; a new push will trigger a fresh attempt.`,
+    `${UNREVIEWABLE_PREFIX}: ${UNREVIEWABLE_EXPLANATIONS[reason]} It won't retry for this commit; a new push will trigger a fresh attempt.`,
     reviewMarker(headSha),
   ].join("\n\n");
 }
@@ -162,8 +188,9 @@ export async function postReview(
     inline: readonly ReviewComment[];
     general: readonly ReviewComment[];
     skippedFiles: readonly string[];
+    sinceSha?: string;
   },
-): Promise<void> {
+): Promise<PostedReview> {
   const baseRequest = {
     owner: job.owner,
     repo: job.repo,
@@ -173,7 +200,7 @@ export async function postReview(
   };
 
   try {
-    await octokit.rest.pulls.createReview({
+    const { data } = await octokit.rest.pulls.createReview({
       ...baseRequest,
       body: buildReviewBody({ ...review, headSha: job.headSha }),
       comments: review.inline.map((comment) => ({
@@ -183,13 +210,14 @@ export async function postReview(
         body: formatComment(comment),
       })),
     });
+    return { reviewId: data.id, inlinePosted: review.inline.length > 0 };
   } catch (error: unknown) {
     // 422 usually means GitHub rejected a line anchor. Fall back to one review with everything in the body.
     const status = (error as { status?: number }).status;
     if (status !== HTTP_UNPROCESSABLE) throw error;
 
     logger.warn("Inline comments rejected, posting summary-only review", { deliveryId: job.deliveryId });
-    await octokit.rest.pulls.createReview({
+    const { data } = await octokit.rest.pulls.createReview({
       ...baseRequest,
       body: buildReviewBody({
         ...review,
@@ -197,5 +225,34 @@ export async function postReview(
         headSha: job.headSha,
       }),
     });
+    return { reviewId: data.id, inlinePosted: false };
   }
+}
+
+/** Reads the severity back from a posted comment's label, e.g. "🟠 **Warning**: ..." → "warning". */
+export function severityFromBody(body: string): Severity | undefined {
+  return SEVERITIES.find((severity) => body.startsWith(SEVERITY_LABELS[severity]));
+}
+
+/** An inline comment as GitHub stored it. */
+export interface PostedComment {
+  readonly id: number;
+  readonly path: string;
+  readonly line?: number | null;
+  readonly body: string;
+}
+
+/** The inline comments GitHub created for one review, with the ids replies will point at. */
+export async function listReviewCommentsForReview(
+  octokit: Octokit,
+  job: ReviewJob,
+  reviewId: number,
+): Promise<PostedComment[]> {
+  return octokit.paginate(octokit.rest.pulls.listCommentsForReview, {
+    owner: job.owner,
+    repo: job.repo,
+    pull_number: job.pullNumber,
+    review_id: reviewId,
+    per_page: 100,
+  });
 }

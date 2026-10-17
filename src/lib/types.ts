@@ -26,7 +26,7 @@ export interface ReplyJob {
 /** Message placed on the SQS queue by the webhook and consumed by the worker. */
 export type QueueJob = ReviewJob | ReplyJob;
 
-export type Severity ="critical" | "warning" | "suggestion";
+export type Severity = "critical" | "warning" | "suggestion";
 
 export interface ReviewComment {
   readonly path: string;
@@ -62,3 +62,19 @@ export interface DiffFile {
   readonly annotatedPatch: string;
   readonly commentableLines: ReadonlySet<number>;
 }
+
+/** The parts of a PR review the worker reads. */
+export interface PullReview {
+  readonly user: { readonly login: string } | null;
+  readonly body: string | null;
+  readonly submitted_at?: string | null;
+}
+
+/** What postReview created: the review, and whether its comments landed inline. */
+export interface PostedReview {
+  readonly reviewId: number;
+  readonly inlinePosted: boolean;
+}
+
+/** Where a PR lives; enough to list or post on it. */
+export type PullRef = Pick<ReviewJob, "owner" | "repo" | "pullNumber">;

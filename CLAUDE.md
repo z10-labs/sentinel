@@ -23,11 +23,18 @@ All credentials live in one Secrets Manager secret (`githubAppId`, `githubPrivat
 - `src/lib/threads.ts`: review-comment threads: select, reply/skip decision, dedupe marker, retract
 - `src/lib/github.ts`: Octokit App auth, list files, dedupe marker, post review with 422 fallback
 - `src/lib/diff.ts`: file filtering, char budget, patch line-number annotation
+- `src/lib/incremental.ts`: follow-up reviews: last reviewed SHA, compare scope, test-only skip, prior comments
+- `src/lib/outcomes.ts`: outcome tracking in DynamoDB (`OutcomesTable`): reply classification, best-effort writes
 - `src/lib/config.ts`: env + cached secret loading
 
 ## Design decisions (keep unless asked)
 - Webhook only enqueues; all slow work happens in the worker.
 - Stale jobs (head SHA changed) are skipped; a hidden `<!-- review-bot:<sha> -->` marker prevents duplicate reviews on SQS redelivery.
+- Follow-up reviews: when the last reviewed SHA is an ancestor of the head (compare status `ahead`), only files changed
+  since then are reviewed, limited to files in the PR (base-branch merges don't count). Rebase / force-push / compare
+  failure falls back to a full review. Pushes touching only tests or generated files are skipped. The bot's earlier
+  comments and their replies go into the prompt so it doesn't repeat itself.
+- Outcome tracking never fails a job: DynamoDB errors are logged, not thrown (the review is already posted).
 - When a PR exceeds the 60k-char diff budget, files are ranked (source > schema/migrations > config/CI > tests >
   generated contracts/snapshots) before the budget is spent; the prompt still lists files in GitHub's order.
 - Comments whose lines GitHub won't accept go into the summary instead of being dropped.
@@ -42,15 +49,16 @@ All credentials live in one Secrets Manager secret (`githubAppId`, `githubPrivat
 - Style: strict TypeScript, no `any`, prefer immutability, named constants, early returns, JSON structured logs.
 
 ## Status
-- Deployed 2026-10-08 as stack `sentinel-test` (us-east-1). GitHub App `sentinel-by-z10` is installed on
-  `Dzithendo31/payme`; it reviewed test PR #12 end to end (4 inline comments, ~9s model time).
+- Stack `sentinel-test` (us-east-1), first deployed 2026-10-08. GitHub App `sentinel-by-z10` is installed on
+  `Dzithendo31/payme` and `Dzithendo31/tutorspaces-api` (since 2026-10-14) and subscribes to **Pull request** and
+  **Pull request review comment**.
+- 2026-10-17: deployed `567e5a3` (repo guidance, reply-to-rethink, diff ranking); DLQ alarm emails the owner
+  (`AlarmEmail` saved in `samconfig.toml`). Reply path not yet exercised on a real thread.
+- Incremental re-review and outcome tracking: on branch `feat/incremental-rereview`, not deployed yet.
+  Planned after: a `.sentinel/learned.md` PR loop fed by the outcomes table.
 - Secret-filling and smoke-test steps: `DEPLOY-TEST.md`. General setup: README.md.
-- Repo guidance + reply-to-rethink written 2026-10-08, not yet deployed. Needs the GitHub App to subscribe to
-  the **Pull request review comment** event. Planned next: incremental re-review (only changes since the last
-  reviewed SHA, prior comments as context), then outcome tracking in DynamoDB and a `.sentinel/learned.md` PR loop.
-- Unit tests (vitest, `test/`) cover the pure logic; handlers, Octokit and the Claude call are untested (need mocks).
-  CI (`.github/workflows/ci.yml`) runs typecheck + tests; it does not run `sam build`.
-- DLQ alarm notifies an SNS topic; email only if deployed with `--parameter-overrides AlarmEmail=...`.
+- Unit tests (vitest, `test/`) cover the pure logic; handlers, Octokit, DynamoDB and the Claude call are untested
+  (need mocks). CI (`.github/workflows/ci.yml`) runs typecheck + tests; it does not run `sam build`.
 - Refusal / `max_tokens` / context-window stops post a "couldn't review" notice and are not retried; other
   errors (incl. 4xx) still retry via SQS. Not done: API-level refusal fallback to another model.
 
