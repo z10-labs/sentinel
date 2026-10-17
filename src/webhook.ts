@@ -3,11 +3,10 @@ import { SendMessageCommand, SQSClient } from "@aws-sdk/client-sqs";
 import type { LambdaFunctionURLEvent, LambdaFunctionURLResult } from "aws-lambda";
 import { loadSecrets, requireEnv } from "./lib/config.js";
 import { logger } from "./lib/logger.js";
+import { TRUSTED_ASSOCIATIONS } from "./lib/threads.js";
 import type { QueueJob, ReplyJob, ReviewJob } from "./lib/types.js";
 
 const REVIEWABLE_ACTIONS: ReadonlySet<string> = new Set(["opened", "synchronize", "reopened", "ready_for_review"]);
-/** Who may make the bot re-think a comment (besides the PR's author). Each reply costs a model call. */
-const TRUSTED_ASSOCIATIONS: ReadonlySet<string> = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
 const sqs = new SQSClient({});
 
 /** The parts of GitHub's pull_request webhook payload this bot uses. */

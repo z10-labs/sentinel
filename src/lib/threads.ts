@@ -1,6 +1,6 @@
 import type { Octokit } from "octokit";
 import { fetchTextFile } from "./guidance.js";
-import type { ReplyJob } from "./types.js";
+import type { PullRef, ReplyJob } from "./types.js";
 
 /** Bounds cost and stops an endless back-and-forth in one thread. */
 export const MAX_BOT_REPLIES_PER_THREAD = 3;
@@ -8,11 +8,15 @@ export const MAX_BOT_REPLIES_PER_THREAD = 3;
 const EXCERPT_CONTEXT_LINES = 40;
 const RETRACTED_BANNER = "> ↩️ **Retracted** after discussion in this thread.";
 
+/** Author associations whose replies the bot answers and treats as context. The PR author is trusted too. */
+export const TRUSTED_ASSOCIATIONS: ReadonlySet<string> = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
+
 /** The parts of a pull request review comment this bot uses. */
 export interface ThreadComment {
   readonly id: number;
   readonly in_reply_to_id?: number;
   readonly user: { readonly login: string; readonly type?: string } | null;
+  readonly author_association?: string;
   readonly body: string;
   readonly created_at: string;
   readonly path: string;
@@ -85,7 +89,7 @@ export function excerptAround(content: string, line: number): string | undefined
     .join("\n");
 }
 
-export async function listReviewComments(octokit: Octokit, job: ReplyJob): Promise<ThreadComment[]> {
+export async function listReviewComments(octokit: Octokit, job: PullRef): Promise<ThreadComment[]> {
   return octokit.paginate(octokit.rest.pulls.listReviewComments, {
     owner: job.owner,
     repo: job.repo,

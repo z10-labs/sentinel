@@ -125,6 +125,26 @@ thread, then answers with one of **Standing by this**, **Revised** or **Retracte
 marks the original comment as retracted. It answers the PR author and repo owners, members and
 collaborators, never bots, and at most 3 times per thread.
 
+## Follow-up reviews
+
+After the first review, each push is reviewed **incrementally**: only the files that changed since the
+last reviewed commit, with Sentinel's earlier comments and their replies as context, so it doesn't repeat
+itself. After a rebase or force-push it reviews the whole PR again. Pushes that only touch tests or
+generated files (OpenAPI contracts, ORM snapshots) are skipped.
+
+## Outcome tracking
+
+Every inline comment is stored in the `OutcomesTable` DynamoDB table as `open`. When a human replies in
+its thread, the reply is classified as **accepted** ("Addressed in…", "Fixed…"), **declined** ("Leaving
+this as is…", "Won't fix", "Not a bug…") or **discussed**, and Sentinel's verdict is stored too. A quick
+tally:
+
+```bash
+aws dynamodb scan --table-name <OutcomesTableName> \
+  --projection-expression "repo, severity, outcome" --output json \
+  | jq -r '.Items[] | "\(.repo.S) \(.severity.S) \(.outcome.S)"' | sort | uniq -c
+```
+
 ## Configuration
 
 | What | Where |
@@ -136,6 +156,8 @@ collaborators, never bots, and at most 3 times per thread.
 | Replies per thread | `MAX_BOT_REPLIES_PER_THREAD` in `src/lib/threads.ts` |
 | Ignored files | `IGNORED_PATH_PATTERNS` in `src/lib/diff.ts` |
 | Max diff size | `MAX_DIFF_CHARS` in `src/lib/diff.ts` |
+| Earlier comments in a follow-up prompt | `MAX_PRIOR_COMMENTS_CHARS` in `src/lib/incremental.ts` |
+| Reply classification | `ACCEPTED_PATTERNS` / `DECLINED_PATTERNS` in `src/lib/outcomes.ts` |
 | Max inline comments | `MAX_INLINE_COMMENTS` in `src/lib/github.ts` |
 | Parallel reviews | `MaximumConcurrency` in `template.yaml` |
 

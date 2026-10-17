@@ -48,6 +48,27 @@ Resources:
         deadLetterTargetArn: !GetAtt ReviewDeadLetterQueue.Arn
         maxReceiveCount: 3
 
+  # One item per inline review comment: what was flagged and how the PR author answered it.
+  # Key: pk = "<owner>/<repo>#<pr>", sk = "comment#<id>". Small and append-mostly, so on-demand billing.
+  OutcomesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain # the history is the point; survive a stack delete or replacement
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
   # Public HTTPS endpoint GitHub posts to. Authenticated by the webhook signature, not IAM.
   WebhookFunction:
     Type: AWS::Serverless::Function
@@ -89,9 +110,12 @@ Resources:
       Environment:
         Variables:
           ANTHROPIC_MODEL: !Ref AnthropicModel
+          OUTCOMES_TABLE: !Ref OutcomesTable
       Policies:
         - AWSSecretsManagerGetSecretValuePolicy:
             SecretArn: !Ref BotSecret
+        - DynamoDBWritePolicy:
+            TableName: !Ref OutcomesTable
       Events:
         ReviewJobs:
           Type: SQS
@@ -171,6 +195,9 @@ Outputs:
   DeadLetterQueueUrl:
     Description: Failed review jobs end up here
     Value: !Ref ReviewDeadLetterQueue
+  OutcomesTableName:
+    Description: Review comment outcomes (accepted / declined / discussed / open)
+    Value: !Ref OutcomesTable
   AlarmTopicArn:
     Description: SNS topic notified when the dead-letter queue alarm changes state
     Value: !Ref AlarmTopic

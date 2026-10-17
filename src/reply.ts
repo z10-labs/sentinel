@@ -1,7 +1,8 @@
 import { getBotLogin, getInstallationClient } from "./lib/github.js";
 import { loadRepoGuidance } from "./lib/guidance.js";
 import { logger } from "./lib/logger.js";
-import { formatReplyBody, requestReply } from "./lib/replier.js";
+import { classifyHumanReply, recordReply } from "./lib/outcomes.js";
+import { formatReplyBody, type ReplyVerdict, requestReply } from "./lib/replier.js";
 import {
   decideReply,
   fetchFileExcerpt,
@@ -11,7 +12,30 @@ import {
   replyMarker,
   selectThread,
 } from "./lib/threads.js";
+import type { ThreadComment } from "./lib/threads.js";
 import type { ReplyJob } from "./lib/types.js";
+
+/**
+ * Records the human's reply on the bot comment it answers. Called before the reply limit or a model
+ * failure can skip the job, and again with the bot's verdict once it has replied.
+ */
+async function trackHumanReply(
+  job: ReplyJob,
+  thread: readonly ThreadComment[],
+  botLogin: string,
+  verdict?: ReplyVerdict,
+): Promise<void> {
+  const [root] = thread;
+  const trigger = thread.find((comment) => comment.id === job.commentId);
+  if (!root || !trigger || root.user?.login !== botLogin || trigger.user?.login === botLogin) return;
+  await recordReply(job, root.id, {
+    replyClass: classifyHumanReply(trigger.body),
+    replyBody: trigger.body,
+    replyAuthor: trigger.user?.login ?? "unknown",
+    root,
+    verdict,
+  });
+}
 
 /**
  * Answers a human's reply to one of the bot's review comments: Claude re-reads the code and the
@@ -33,6 +57,7 @@ export async function answerReply(job: ReplyJob): Promise<void> {
   }
 
   const thread = selectThread(comments, job.inReplyToId);
+  await trackHumanReply(job, thread, botLogin);
   const decision = decideReply({ thread, triggerCommentId: job.commentId, botLogin });
   const [root] = thread;
   if (decision.action === "skip" || !root) {
@@ -74,6 +99,7 @@ export async function answerReply(job: ReplyJob): Promise<void> {
   // leave a retraction unmarked if the edit failed after the reply posted.
   if (verdict === "retract") await markRetracted(octokit, job, root);
   await postThreadReply(octokit, job, root.id, formatReplyBody(outcome.value, replyMarker(job.commentId)));
+  await trackHumanReply(job, thread, botLogin, verdict);
 
   logger.info("Replied in thread", {
     ...context,
