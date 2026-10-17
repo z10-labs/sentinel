@@ -8,9 +8,11 @@ import {
   postReview,
   postUnreviewableNotice,
 } from "./lib/github.js";
+import { loadRepoGuidance } from "./lib/guidance.js";
 import { logger } from "./lib/logger.js";
 import { requestReview } from "./lib/reviewer.js";
-import type { ReviewJob } from "./lib/types.js";
+import type { QueueJob, ReviewJob } from "./lib/types.js";
+import { answerReply } from "./reply.js";
 
 async function reviewPullRequest(job: ReviewJob): Promise<void> {
   const context = { deliveryId: job.deliveryId, repo: `${job.owner}/${job.repo}`, pr: job.pullNumber };
@@ -39,12 +41,20 @@ async function reviewPullRequest(job: ReviewJob): Promise<void> {
     return;
   }
 
+  // Read from the default branch so the PR under review can't rewrite its own instructions.
+  const guidance = await loadRepoGuidance(octokit, {
+    owner: job.owner,
+    repo: job.repo,
+    defaultBranch: pullRequest.base.repo.default_branch,
+  });
+
   const startedAt = Date.now();
   const outcome = await requestReview({
     title: pullRequest.title,
     description: pullRequest.body ?? "",
     files: included,
     skippedFiles: skipped,
+    guidance,
   });
 
   // Permanent failure: tell the PR once and return normally so SQS doesn't retry a doomed job.
@@ -72,12 +82,17 @@ async function reviewPullRequest(job: ReviewJob): Promise<void> {
     filesSkipped: skipped.length,
     inlineComments: inline.length,
     generalComments: general.length,
+    guidancePath: guidance?.path,
     modelMs: Date.now() - startedAt,
   });
 }
 
 async function processRecord(record: SQSRecord): Promise<void> {
-  const job = JSON.parse(record.body) as ReviewJob;
+  const job = JSON.parse(record.body) as QueueJob;
+  if (job.kind === "reply") {
+    await answerReply(job);
+    return;
+  }
   await reviewPullRequest(job);
 }
 

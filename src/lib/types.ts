@@ -1,5 +1,6 @@
-/** Message placed on the SQS queue by the webhook and consumed by the worker. */
+/** Review a PR at a commit. `kind` is optional so jobs queued before replies existed still parse. */
 export interface ReviewJob {
+  readonly kind?: "review";
   readonly deliveryId: string;
   readonly installationId: number;
   readonly owner: string;
@@ -8,7 +9,24 @@ export interface ReviewJob {
   readonly headSha: string;
 }
 
-export type Severity = "critical" | "warning" | "suggestion";
+/** Re-evaluate a Sentinel review comment after a human replied in its thread. */
+export interface ReplyJob {
+  readonly kind: "reply";
+  readonly deliveryId: string;
+  readonly installationId: number;
+  readonly owner: string;
+  readonly repo: string;
+  readonly pullNumber: number;
+  /** The human's reply that triggered this job. */
+  readonly commentId: number;
+  /** The comment it replied to, normally the thread's first comment. */
+  readonly inReplyToId: number;
+}
+
+/** Message placed on the SQS queue by the webhook and consumed by the worker. */
+export type QueueJob = ReviewJob | ReplyJob;
+
+export type Severity ="critical" | "warning" | "suggestion";
 
 export interface ReviewComment {
   readonly path: string;

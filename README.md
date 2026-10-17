@@ -69,7 +69,7 @@ GitHub → Settings → Developer settings → GitHub Apps → **New GitHub App*
 | Repository permissions → Pull requests | **Read and write** |
 | Repository permissions → Contents | **Read-only** |
 | Repository permissions → Metadata | Read-only (default) |
-| Subscribe to events | **Pull request** |
+| Subscribe to events | **Pull request**, **Pull request review comment** |
 | Where can this app be installed? | Only on this account |
 
 After creating it, note the **App ID**, then click **Generate a private key** (downloads a `.pem`).
@@ -111,13 +111,29 @@ sam logs -n ReviewWorkerFunction --stack-name <stack> --tail
 - **Failures in the DLQ:** read them with `aws sqs receive-message --queue-url <DeadLetterQueueUrl>`,
   fix the cause, then redrive them from the SQS console.
 
+## Per-repo guidance
+
+Sentinel reads review instructions from the repository's **default branch**: the first of
+`.sentinel/REVIEW.md`, `REVIEW.md` or `CLAUDE.md` that exists (up to 8,000 characters). Use it for
+conventions, things not worth flagging, and areas that need extra care. It is read from the default
+branch, never the PR, so a pull request can't change the rules it is reviewed under.
+
+## Replying to a comment
+
+Reply in the thread of any Sentinel comment and it re-reads the code (at the PR's current head) and the
+thread, then answers with one of **Standing by this**, **Revised** or **Retracted**. A retraction also
+marks the original comment as retracted. It answers the PR author and repo owners, members and
+collaborators, never bots, and at most 3 times per thread.
+
 ## Configuration
 
 | What | Where |
 |---|---|
 | Model | `AnthropicModel` stack parameter |
 | Failure alert email | `AlarmEmail` stack parameter (confirm the SNS email) |
-| Review instructions | `SYSTEM_PROMPT` in `src/lib/reviewer.ts` |
+| Review instructions | `SYSTEM_PROMPT` in `src/lib/reviewer.ts`, plus each repo's guidance file |
+| Reply instructions | `SYSTEM_PROMPT` in `src/lib/replier.ts` |
+| Replies per thread | `MAX_BOT_REPLIES_PER_THREAD` in `src/lib/threads.ts` |
 | Ignored files | `IGNORED_PATH_PATTERNS` in `src/lib/diff.ts` |
 | Max diff size | `MAX_DIFF_CHARS` in `src/lib/diff.ts` |
 | Max inline comments | `MAX_INLINE_COMMENTS` in `src/lib/github.ts` |

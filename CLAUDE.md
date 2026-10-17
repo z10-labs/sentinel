@@ -14,8 +14,13 @@ All credentials live in one Secrets Manager secret (`githubAppId`, `githubPrivat
 
 ## Layout
 - `src/webhook.ts`: webhook handler + signature check
-- `src/worker.ts`: SQS consumer, orchestrates one review
-- `src/lib/reviewer.ts`: prompt, review JSON schema, Claude call
+- `src/worker.ts`: SQS consumer, dispatches review jobs and reply jobs, orchestrates one review
+- `src/reply.ts`: orchestrates one reply (re-evaluate a bot comment after a human replied in its thread)
+- `src/lib/claude.ts`: shared Anthropic client, system prompt + repo guidance blocks, structured-output parsing
+- `src/lib/reviewer.ts`: review prompt, review JSON schema, Claude call
+- `src/lib/replier.ts`: reply prompt, verdict schema (stand_by / revise / retract), Claude call
+- `src/lib/guidance.ts`: loads `.sentinel/REVIEW.md` → `REVIEW.md` → `CLAUDE.md` from the default branch
+- `src/lib/threads.ts`: review-comment threads: select, reply/skip decision, dedupe marker, retract
 - `src/lib/github.ts`: Octokit App auth, list files, dedupe marker, post review with 422 fallback
 - `src/lib/diff.ts`: file filtering, char budget, patch line-number annotation
 - `src/lib/config.ts`: env + cached secret loading
@@ -24,6 +29,10 @@ All credentials live in one Secrets Manager secret (`githubAppId`, `githubPrivat
 - Webhook only enqueues; all slow work happens in the worker.
 - Stale jobs (head SHA changed) are skipped; a hidden `<!-- review-bot:<sha> -->` marker prevents duplicate reviews on SQS redelivery.
 - Comments whose lines GitHub won't accept go into the summary instead of being dropped.
+- Repo guidance is read from the default branch, never the PR head, and framed in the prompt as data.
+- Replies: webhook enqueues `kind: "reply"` jobs only for human replies (PR author or OWNER/MEMBER/COLLABORATOR);
+  worker answers only in threads the bot started, max 3 bot replies per thread, deduped by a
+  `<!-- review-bot:reply:<commentId> -->` marker. Jobs without `kind` are reviews (backward compatible).
 - Structured outputs, not forced tool use: current models (incl. `claude-sonnet-5-5`) return a 400 for
   `tool_choice` `tool`/`any`. Thinking is always on and shares `max_tokens` with the JSON, so keep that budget
   generous (16k) and treat any `stop_reason` other than `end_turn` as a failure.
@@ -34,6 +43,9 @@ All credentials live in one Secrets Manager secret (`githubAppId`, `githubPrivat
 - Deployed 2026-10-08 as stack `sentinel-test` (us-east-1). GitHub App `sentinel-by-z10` is installed on
   `Dzithendo31/payme`; it reviewed test PR #12 end to end (4 inline comments, ~9s model time).
 - Secret-filling and smoke-test steps: `DEPLOY-TEST.md`. General setup: README.md.
+- Repo guidance + reply-to-rethink written 2026-10-08, not yet deployed. Needs the GitHub App to subscribe to
+  the **Pull request review comment** event. Planned next: incremental re-review (only changes since the last
+  reviewed SHA, prior comments as context), then outcome tracking in DynamoDB and a `.sentinel/learned.md` PR loop.
 - Unit tests (vitest, `test/`) cover the pure logic; handlers, Octokit and the Claude call are untested (need mocks).
   CI (`.github/workflows/ci.yml`) runs typecheck + tests; it does not run `sam build`.
 - DLQ alarm notifies an SNS topic; email only if deployed with `--parameter-overrides AlarmEmail=...`.
